@@ -1,0 +1,394 @@
+---
+title: Model for Determining the Class of Barbell Lifts
+author: Greig Robertson
+date: 11/10/2017
+output: html_document
+keep_md: yes
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)    # this package loads
+                        #  ggplot for plotting and
+                        #  dplyr for processing data (aggregating, filtering etc)
+library(caret)        # for training models and predicting 
+library(randomForest) # for the randomForest() function
+library(knitr)        # for using kable to generate tables
+
+# Enable caching since some models take many minutes to execute
+knitr::opts_chunk$set(cache=TRUE)
+```
+
+
+## 1. Overview
+This report examines a data set from a Human Activity Recognition (HAR) project.  The data set details many variables for a specific activity - a weight lifting exercise - obtained from subjects wearing activity monitoring devices.  The project attempted to determine if the person performing the exercise was doing it properly.  The data set and further information are available from http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har.
+
+This report aims to create and train a model in order to assign the correct execution class to set of test data.  Where the classes are as follows:
+
+1. Exactly according to the specification (Class A)
+1. Throwing the elbows to the front       (Class B)
+1. Lifting the dumbbell only halfway      (Class C)
+1. Lowering the dumbbell only halfway     (Class D)
+1. Throwing the hips to the front         (Class E)
+
+The report loads the data set and performs basic exploratory data analyses on it, providing a summary of the data.  The data is also cleaned and tidied.
+
+Since the test data set did not contain the "Class" of the exercise, the training data was further split into training and testing data sets by sampling.  A few different types of models were created and executed aginst the sampled training and testing data sets.  The models were compared in terms of accuracy and a the best model was executed against the full training and test data sets.
+
+Conclusions and the assumptions are stated in the report.  Code listings are in the Appendix.
+
+
+## 2. Exploratory Data Analysis
+
+### Reading the data
+
+The training (`pml-training.csv`) and testing (`pml-testing.csv`) data sets were downloaded from the above web site and loaded into `R` using the `read_csv()` function from the `tidyverse` package.
+
+```{r warning=FALSE, include=FALSE}
+source("10_csv_col_spec.R")  # contains the names and data types for the files, generated from read_csv()
+training <- read_csv("pml-training.csv", na = c("", "NA", "#DIV/0!"), col_types = col_spec )
+testing  <- read_csv("pml-testing.csv",  na = c("", "NA", "#DIV/0!"))
+```
+
+The `read_csv()` function is good at deriving the data types of variables and it was noteed for the training data set that there were 160 variables of which 35 were integers, 115 were double, and 10 were characters.  Further investigation revealed that some character columns had missing values set to one of "", "NA", or "#DIV/0!".  Also, row 5373 had some variables coded as decimals, when it appeared that these should be integers (see source code section).  This row was cleaned and the variables rounded to the nearest integer value.
+
+```{r include=FALSE}
+training %>% filter( grepl('\\.', as.character(magnet_forearm_y)  )) %>% select(magnet_forearm_y)
+training %>% filter( grepl('\\.', as.character(magnet_forearm_z)  )) %>% select(magnet_forearm_z)
+training %>% filter( grepl('\\.', as.character(magnet_dumbbell_z) )) %>% select(magnet_dumbbell_z)
+
+training$magnet_forearm_y  <- as.integer(round(training$magnet_forearm_y))
+training$magnet_forearm_z  <- as.integer(round(training$magnet_forearm_z))
+training$magnet_dumbbell_z <- as.integer(round(training$magnet_dumbbell_z))
+```
+
+### Tidying the Data
+
+Not all the variables were used in the analysis.  By looking at the documentation, it could be seen that arm, belt and dumb bell senors were used and therefore the following variables were not considered:  unique id of the observation, user_name, raw_timestamp_part_1, raw_timestamp_part_2, cvtd_timestamp, new_window, num_window
+
+Also, many variables had `NA` values (for example `amplitude_roll_forearm`, `amplitude_pitch_forearm`, etc) and these were dropped from the training and testing data sets.
+
+The same processing was performed on the test data set to create two clean and tidy data sets: `training_arm_belt` and `testing_arm_belt`.  The code for this is listed in the appendix.
+
+```{r include=FALSE}
+# Function to only select a subset of predictors
+tidy_data <- function(data) {
+
+  # select only the variables with arm, belt bell or classe in the name
+  data_arm_belt           <- data %>% select(matches("arm|belt|bell|classe"))
+  
+  # find variables (columns) without any NA values
+  tab_na_column_count     <- is.na(data_arm_belt) %>% colSums
+  tab_not_na_column_names <- cbind(name  = names(tab_na_column_count),
+                                   value = gather(as.tibble(tab_na_column_count))) %>%
+                             filter(value == 0) %>%
+                             select(name)
+
+  # select only variables with complete set of values
+  data_arm_belt <- data_arm_belt %>% select( as.character(tab_not_na_column_names$name) )
+}
+
+# Training Data - tidy
+training_arm_belt <- tidy_data(training)
+# Testing Data - tidy
+testing_arm_belt  <- tidy_data(testing)  
+```
+
+### Exploring the data
+
+A summary of the training data was examined `summary(training_arm_belt)` and a plot of various variables was made.  For example:
+
+```{r echo=FALSE, fig.width=6, fig.height=4}
+featurePlot(x=training_arm_belt[,c("roll_belt", "roll_arm", "roll_dumbbell")], y = training$classe, plot="pairs")
+```
+
+Mutiple feature plots were created, however, no clear patterns could be ascertained from plotting relationships between subsets of variables.
+
+
+## 3. Sampling Data
+
+In order to train and test the model, the training data set was split using the `caret::createDataPartition()` function based on the `classe` variable as follows:
+
+```{r echo=TRUE}
+# Training Sampling
+inTrain      <- createDataPartition(y = training_arm_belt$classe, p = 0.75, list = FALSE)
+sample_training <- training_arm_belt[inTrain,]
+sample_testing  <- training_arm_belt[-inTrain,]
+```
+
+
+## 4. Model Comparison
+
+In order to determine the best model to use for predicting `classe`, a few models were created using different methods.  Below different models are created and compred.
+
+### Decision Tree
+
+```{r message=FALSE, warning=FALSE}
+tab_model   <- train(classe ~ ., data = sample_training, method = "rpart")
+tab_predict <- predict(tab_model, sample_testing[,-53])
+conf_matrix_rpart <- confusionMatrix(sample_testing$classe, tab_predict)
+conf_matrix_rpart$table
+```
+
+The accuracy of this model is quite poor *`r round(conf_matrix_rpart$overall[1], 2)`* and from the confusion matrix it can be seen that it has completely failed to pick any "D" class.
+
+### Random Forest
+
+The next model was a random forest. 
+
+```{r}
+tab_model   <- randomForest(factor(classe) ~ ., data = sample_training, ntree = 80)
+tab_predict <- predict(tab_model, newdata = sample_testing[,-53])
+conf_matrix_rf <- confusionMatrix(sample_testing$classe, tab_predict)
+conf_matrix_rf$table
+```
+
+By looking at the plot of the error rate for each class, it can be seen that it drops off quickly.  Therefore, initially, the model was created using the default number of trees of 500, however this was reduced to 80 `ntree = 80` with a similar accuracy of `r round(conf_matrix_rf$overall[1], 2)`.
+ 
+```{r}
+plot(tab_model)
+```
+
+
+### PCA
+
+Since there are quite a number of variables (53), PCA was used to determine if these could be reduced to a smaller set.  The number of iterations for sampling was set to 10 and the method was set to "cv".  
+
+The resulting pre-processed variables were plotted to determine if there were any obvious patterns.
+
+```{r}
+preProc  <- preProcess(sample_training[,-53], method="pca", pcaComp = 26)
+
+trainPC  <- predict(preProc, sample_training[,-53])
+
+trainPC        <- cbind(sample_training$classe, trainPC)
+trainPC        <- as.data.frame(trainPC)
+names_df       <- names(trainPC)
+names_df[1]    <- "classe"
+names(trainPC) <- names_df
+```
+
+Plots were made of various components to determine if there were any obvious groupings.  None could be found.
+
+```{r echo=FALSE}
+plot(trainPC$PC1, trainPC$PC2, col = trainPC$classe)
+```
+
+A random forest model and a gradient boosting model were applied to the variables.
+
+```{r pca_rf_gbm, include=FALSE}
+# Random Forest
+modelFit       <- randomForest(classe ~ ., data = trainPC, ntree = 80)
+testPC         <- predict(preProc,  sample_testing[,-53])
+predict_test   <- predict(modelFit, testPC)
+conf_matrix_pca_rf <- confusionMatrix(sample_testing$classe, predict_test)
+
+# GBM with cross validation
+trainControl    <- trainControl(method = "cv", number = 10)
+modelFit        <- train(classe ~ ., method = "gbm", data = trainPC, trControl = trainControl)
+testPC          <- predict(preProc,  sample_testing[,-53])
+predict_test    <- predict(modelFit, testPC)
+conf_matrix_pca_gbm <- confusionMatrix(sample_testing$classe, predict_test)
+```
+
+* Random forest accuracy : `r round(conf_matrix_pca_rf$overall[1], 2)`
+* Gradient boost accuracy : `r round(conf_matrix_pca_gbm$overall[1], 2)`
+
+Neither the results or accuracy of both models were as good as the pure random forest above.  The models did perform similarlay across all classes.
+
+
+## Selected Model
+
+### Execution against test set
+
+```{r}
+tab_model   <- randomForest(factor(classe) ~ ., data = training_arm_belt, ntree = 80)
+
+# show out-of-bag error
+error_rate <- round(tab_model$err.rate[80,1], 2)
+```
+
+The random forest model was used against the actual test data set and a model error rate of `r error_rate` was noted.
+
+
+### Out of Sample Error
+
+In order to estimate the out of sample error, the random forest model was executed multiple times.  Each time the model would be slightly different and the resulting out-of-bag (OOB) error rate was captured each time.  A boxplot of the error rates was plotted.
+
+
+```{r oob_error_est, echo=FALSE, warning=FALSE}
+oob_error_rate <- c()
+for(ix in 1:10) {
+  tab_model <- randomForest(factor(classe) ~ ., data = training_arm_belt, ntree = 80)
+  oob_error_rate[ix] <- tab_model$err.rate[80,1]
+}
+max_oob_error_rate <- round(max(oob_error_rate), 4)
+```
+
+```{r echo=FALSE, fig.width=3, fig.height=3}
+boxplot(oob_error_rate, ylab="Error Rate")
+```
+From this, the out of sample error rate was estimated at `r max_oob_error_rate`.
+
+
+## Assumptions
+
+The following assumptions were made:
+
+* It was assumed that there is no relationship between observations - so data was treated as independent.
+
+
+## Conclusion
+
+The model above predicted the class of the exercise for the test data set based on the training set.  The conclusions are:
+
+* The random forest model performed well on cross validation by sampling the training set.
+
+
+## Appendix
+
+### R Code
+
+Read in data
+```{r eval=FALSE}
+source("10_csv_col_spec.R")  # contains the names and data types for the files, generated from read_csv()
+training <- read_csv("pml-training.csv", na = c("", "NA", "#DIV/0!"), col_types = col_spec )
+testing  <- read_csv("pml-testing.csv",  na = c("", "NA", "#DIV/0!"))
+```
+
+Correct row 5373 by converting decimal values to integer
+```{r eval=FALSE}
+training %>% filter( grepl('\\.', as.character(magnet_forearm_y)  )) %>% select(magnet_forearm_y)
+training %>% filter( grepl('\\.', as.character(magnet_forearm_z)  )) %>% select(magnet_forearm_z)
+training %>% filter( grepl('\\.', as.character(magnet_dumbbell_z) )) %>% select(magnet_dumbbell_z)
+
+training$magnet_forearm_y  <- as.integer(round(training$magnet_forearm_y))
+training$magnet_forearm_z  <- as.integer(round(training$magnet_forearm_z))
+training$magnet_dumbbell_z <- as.integer(round(training$magnet_dumbbell_z))
+```
+
+
+Tidy the data
+```{r eval=FALSE}
+# Function to only select a subset of predictors
+tidy_data <- function(data) {
+
+  # select only the variables with arm, belt bell or classe in the name
+  data_arm_belt           <- data %>% select(matches("arm|belt|bell|classe"))
+  
+  # find variables (columns) without any NA values
+  tab_na_column_count     <- is.na(data_arm_belt) %>% colSums
+  tab_not_na_column_names <- cbind(name  = names(tab_na_column_count),
+                                   value = gather(as.tibble(tab_na_column_count))) %>%
+                             filter(value == 0) %>%
+                             select(name)
+
+  # select only variables with complete set of values
+  data_arm_belt <- data_arm_belt %>% select( as.character(tab_not_na_column_names$name) )
+}
+
+# Training Data - tidy
+training_arm_belt <- tidy_data(training)
+# Testing Data - tidy
+testing_arm_belt  <- tidy_data(testing)  
+```
+
+Feature Plot
+```{r eval=FALSE}
+featurePlot(x=training_arm_belt[,c("roll_belt", "roll_arm", "roll_dumbbell")], y = training$classe, plot="pairs")
+```
+
+
+Split data into training and testing by sampling
+```{r eval=FALSE}
+inTrain      <- createDataPartition(y = training_arm_belt$classe, p = 0.75, list = FALSE)
+sample_training <- training_arm_belt[inTrain,]
+sample_testing  <- training_arm_belt[-inTrain,]
+```
+
+
+Decision Tree
+```{r eval=FALSE}
+tab_model   <- train(classe ~ ., data = sample_training, method = "rpart")
+tab_predict <- predict(tab_model, sample_testing[,-53])
+conf_matrix_rpart <- confusionMatrix(sample_testing$classe, tab_predict)
+
+conf_matrix_rpart$table
+```
+
+
+Random Forest
+```{r eval=FALSE}
+tab_model   <- randomForest(factor(classe) ~ ., data = sample_training, ntree = 80)
+tab_predict <- predict(tab_model, newdata = sample_testing[,-53])
+conf_matrix_rf <- confusionMatrix(sample_testing$classe, tab_predict)
+conf_matrix_rf$table
+
+plot(tab_model)
+```
+
+
+Determine number of components for PCA
+```{r eval=FALSE}
+preProcess(sample_training[,-53], method="pca")
+```
+
+Execute PCA on suggested number of components (26)
+```{r eval=FALSE}
+preProc  <- preProcess(sample_training[,-53], method="pca", pcaComp = 26)
+
+trainPC  <- predict(preProc, sample_training[,-53])
+
+trainPC        <- cbind(sample_training$classe, trainPC)
+trainPC        <- as.data.frame(trainPC)
+names_df       <- names(trainPC)
+names_df[1]    <- "classe"
+names(trainPC) <- names_df
+
+plot(trainPC$PC1, trainPC$PC2, col = trainPC$classe)
+```
+
+Apply Random Forest and GBM to PCA
+```{r eval=FALSE}
+# Random Forest
+modelFit       <- randomForest(classe ~ ., data = trainPC, ntree = 80)
+testPC         <- predict(preProc,  sample_testing[,-53])
+predict_test   <- predict(modelFit, testPC)
+conf_matrix_pca_rf <- confusionMatrix(sample_testing$classe, predict_test)
+
+# GBM with cross validation
+trainControl    <- trainControl(method = "cv", number = 10)
+modelFit        <- train(classe ~ ., method = "gbm", data = trainPC, trControl = trainControl)
+testPC          <- predict(preProc,  sample_testing[,-53])
+predict_test    <- predict(modelFit, testPC)
+conf_matrix_pca_gbm <- confusionMatrix(sample_testing$classe, predict_test)
+```
+
+
+Calculate estimate for out of sample error
+```{r eval=FALSE}
+oob_error_rate <- c()
+for(ix in 1:10) {
+  tab_model <- randomForest(factor(classe) ~ ., data = training_arm_belt, ntree = 80)
+  oob_error_rate[ix] <- tab_model$err.rate[80,1]
+}
+
+max_oob_error_rate <- max(oob_error_rate)
+
+boxplot(oob_error_rate)
+```
+
+
+### Session and Libraries Used
+
+This document used the folowing packages:
+
+```
+library(tidyverse)    # this package loads
+                        #  ggplot for plotting and
+                        #  dplyr for processing data (aggregating, filtering etc)
+library(caret)        # for training models and predicting 
+library(randomForest) # for the randomForest() function
+library(knitr)        # for using kable to generate tables
+```
+
+This document was created using RStudio `1.1.383` using R version `r R.version$version.string`.
